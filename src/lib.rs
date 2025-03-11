@@ -6,10 +6,10 @@ use winapi::{
     shared::guiddef::GUID,
     um::{
         combaseapi::{CoCreateInstance, CoInitializeEx, CoUninitialize},
-        cguid::GUID_NULL,
+        cguid::GUID_NULL, // Import GUID_NULL
         oleauto::{SafeArrayAccessData, SafeArrayGetLBound, SafeArrayGetUBound, SafeArrayUnaccessData, SysStringLen},
         oaidl::{IDispatch, DISPPARAMS, VARIANT},
-        oaidl::SAFEARRAY,
+        oaidl::SAFEARRAY, // Import SAFEARRAY from the public module
         objbase::COINIT_APARTMENTTHREADED,
         winnt::HRESULT,
     },
@@ -122,26 +122,29 @@ impl MedQrng {
         variant_to_bstr(&var)
     }
 
-    /// Retrieves runtime information (SAFEARRAY of VT_R4) from RuntimeInfo.
+    /// Retrieves runtime info (SAFEARRAY of VT_R4) from RuntimeInfo.
     pub fn runtime_info(&self) -> Result<Vec<f32>> {
         let var = self.invoke_property("RuntimeInfo", &[])?;
         variant_to_f32_array(&var)
     }
 
-    /// Retrieves diagnostics data (SAFEARRAY of VT_UI1) from Diagnostics(dxCode).
+    /// Retrieves diagnostics data (SAFEARRAY of VT_UI1) from Diagnostics.
+    /// In our implementation Diagnostics is invoked as a method.
     pub fn diagnostics(&self, dx_code: i32) -> Result<Vec<u8>> {
-        let var = self.invoke_property_with_i32_arg("Diagnostics", dx_code)?;
+        let var = self.invoke_method_with_i32_arg("Diagnostics", dx_code)?;
         variant_to_byte_array(&var)
     }
 
     /// Calls the Clear() method.
     pub fn clear(&self) -> Result<()> {
-        self.invoke_method("Clear", &[])
+        self.invoke_method("Clear", &[])?;
+        Ok(())
     }
 
     /// Calls the Reset() method.
     pub fn reset(&self) -> Result<()> {
-        self.invoke_method("Reset", &[])
+        self.invoke_method("Reset", &[])?;
+        Ok(())
     }
 }
 
@@ -197,7 +200,16 @@ impl MedQrng {
     }
 
     /// Invokes a COM method (DISPATCH_METHOD) with optional arguments.
+    /// This version does not expect a return value.
     fn invoke_method(&self, name: &str, args: &[VARIANT]) -> Result<()> {
+        unsafe {
+            let _ = self.invoke_method_return(name, args)?;
+            Ok(())
+        }
+    }
+
+    /// Invokes a COM method (DISPATCH_METHOD) with optional arguments and returns the VARIANT.
+    fn invoke_method_return(&self, name: &str, args: &[VARIANT]) -> Result<VARIANT> {
         unsafe {
             let dispid = get_dispid(self.p_disp, name)?;
             let mut dp: DISPPARAMS = mem::zeroed();
@@ -205,22 +217,33 @@ impl MedQrng {
                 dp.rgvarg = args.as_ptr() as *mut VARIANT;
                 dp.cArgs = args.len() as u32;
             }
+            let mut var_result: VARIANT = mem::zeroed();
             let hr = (*self.p_disp).Invoke(
                 dispid,
                 &GUID_NULL,
                 LOCALE_USER_DEFAULT,
                 DISPATCH_METHOD,
                 &mut dp,
-                ptr::null_mut(),
+                &mut var_result,
                 ptr::null_mut(),
                 ptr::null_mut(),
             );
             if hr == S_OK {
-                Ok(())
+                Ok(var_result)
             } else {
                 Err(anyhow!("Invoke('{}') failed: 0x{:08X}", name, hr))
             }
         }
+    }
+
+    /// Invokes a COM method with a single i32 argument and returns the VARIANT.
+    fn invoke_method_with_i32_arg(&self, name: &str, arg: i32) -> Result<VARIANT> {
+        let mut var_arg: VARIANT = unsafe { mem::zeroed() };
+        unsafe {
+            var_arg.n1.n2_mut().vt = VT_I4;
+            *var_arg.n1.n2_mut().n3.lVal_mut() = arg;
+        }
+        self.invoke_method_return(name, &[var_arg])
     }
 }
 
@@ -280,7 +303,7 @@ fn variant_to_byte_array(var: &VARIANT) -> Result<Vec<u8>> {
         if (vt & VT_ARRAY) != VT_ARRAY || (vt & VT_UI1) != VT_UI1 {
             return Err(anyhow!("Expected SAFEARRAY of bytes, but got vt=0x{:X}", vt));
         }
-        // Get the SAFEARRAY pointer by dereferencing the union field.
+        // Get the SAFEARRAY pointer by calling parray() and dereferencing
         let psa: *mut SAFEARRAY = *var.n1.n2().n3.parray();
         if psa.is_null() {
             return Err(anyhow!("Null SAFEARRAY pointer"));
@@ -311,7 +334,6 @@ fn variant_to_bstr(var: &VARIANT) -> Result<String> {
         if vt != VT_BSTR {
             return Err(anyhow!("Expected BSTR, but got vt=0x{:X}", vt));
         }
-        // Get the BSTR pointer by dereferencing.
         let bstr_ptr = *var.n1.n2().n3.bstrVal();
         if bstr_ptr.is_null() {
             return Ok(String::new());
@@ -327,10 +349,7 @@ fn variant_to_f32_array(var: &VARIANT) -> Result<Vec<f32>> {
     unsafe {
         let vt = var.n1.n2().vt;
         if (vt & VT_ARRAY) != VT_ARRAY || (vt & VT_R4) != VT_R4 {
-            return Err(anyhow!(
-                "Expected SAFEARRAY of f32 (VT_ARRAY|VT_R4), got vt=0x{:X}",
-                vt
-            ));
+            return Err(anyhow!("Expected SAFEARRAY of f32 (VT_ARRAY|VT_R4), got vt=0x{:X}", vt));
         }
         let psa: *mut SAFEARRAY = *var.n1.n2().n3.parray();
         if psa.is_null() {
